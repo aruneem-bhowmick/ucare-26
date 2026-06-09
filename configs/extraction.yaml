@@ -1,0 +1,24 @@
+# Hidden state extraction configuration.
+#
+# Controls how intermediate representations are extracted from
+# transformer layers, including which pooling strategy to use,
+# batch sizing, and output paths.
+
+extraction:
+  # Pooling strategy for downstream probes: "last_token" or "mean"
+  pooling: "last_token"
+
+  # Which layers to extract (-1 = all layers)
+  layers: -1
+
+  # Batch size for extraction runs
+  batch_size: 32
+
+  # Maximum sequence length (tokens)
+  max_seq_length: 512
+
+  # Output directory for extracted representations
+  output_dir: "outputs/extractions"
+
+  # Random seed for reproducibility
+  seed: 42

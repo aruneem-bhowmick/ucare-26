@@ -1,0 +1,20 @@
+# Default model configuration for Pythia suite experiments.
+#
+# This file specifies which model to load, its revision, and the
+# expected architecture parameters for validation. The _expected
+# block is read-only reference data derived from the HuggingFace
+# model card and should not be modified.
+
+model:
+  name: "EleutherAI/pythia-70m-deduped"
+  revision: "main"
+  precision: "float16"
+
+  # Architecture reference (read-only, from HuggingFace config).
+  # Used by validation code to assert correct hidden state shapes.
+  _expected:
+    num_hidden_layers: 6
+    hidden_size: 512
+    num_attention_heads: 8
+    vocab_size: 50304
+    max_position_embeddings: 2048

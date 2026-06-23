@@ -87,3 +87,77 @@ def load_mrpc(
 
     logger.info("Loaded MRPC (%s): %d examples", split, len(ds))
     return ds
+
+
+def load_lama_trex(
+    split: str = "train",
+    max_examples: int | None = None,
+    seed: int = 42,
+    relations: list[str] | None = None,
+) -> Dataset:
+    """Load the LAMA T-REx factual knowledge probing dataset.
+
+    Source: ``datasets.load_dataset("lama", "trex")``.
+
+    For each example the ``masked_sentence`` is truncated at the
+    ``[MASK]`` token to form a prompt. The ``predicate_id`` strings
+    are mapped to contiguous integer labels for relation-type
+    classification.
+
+    Args:
+        split: Dataset split to load.  T-REx only has ``"train"``.
+        max_examples: If provided, subsample to this many examples.
+        seed: Random seed for reproducible subsampling.
+        relations: If provided, keep only examples whose
+            ``predicate_id`` is in this list.
+
+    Returns:
+        A ``Dataset`` with columns ``text``, ``label``,
+        ``example_id``, ``obj_label``, ``sub_label``,
+        ``predicate_id``.
+    """
+    ds = load_dataset("lama", "trex", split=split)
+
+    if relations is not None:
+        ds = ds.filter(lambda ex: ex["predicate_id"] in set(relations))
+
+    # Build a mapping from predicate_id strings to contiguous ints.
+    unique_predicates = sorted(set(ds["predicate_id"]))
+    predicate_to_idx: dict[str, int] = {
+        pred: idx for idx, pred in enumerate(unique_predicates)
+    }
+
+    def _transform(example: dict, idx: int) -> dict:
+        masked = example["masked_sentences"][0]
+        # Truncate at [MASK] to form the prompt.
+        mask_pos = masked.find("[MASK]")
+        if mask_pos >= 0:
+            text = masked[:mask_pos].rstrip()
+        else:
+            text = masked
+
+        return {
+            "text": text,
+            "label": predicate_to_idx[example["predicate_id"]],
+            "example_id": idx,
+            "obj_label": example["obj_label"],
+            "sub_label": example["sub_label"],
+            "predicate_id": example["predicate_id"],
+        }
+
+    columns_to_remove = [
+        c for c in ds.column_names
+        if c not in {"obj_label", "sub_label", "predicate_id"}
+    ]
+    ds = ds.map(
+        _transform,
+        with_indices=True,
+        remove_columns=columns_to_remove,
+    )
+
+    if max_examples is not None and max_examples < len(ds):
+        ds = ds.shuffle(seed=seed).select(range(max_examples))
+
+    logger.info("Loaded LAMA T-REx (%s): %d examples, %d relations",
+                split, len(ds), len(unique_predicates))
+    return ds

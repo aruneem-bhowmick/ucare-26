@@ -50,3 +50,6 @@ multirun/
 
 # Logs
 logs/
+
+# R&D documentation
+spec/

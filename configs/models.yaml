@@ -1,0 +1,56 @@
+# Pythia model registry with full architecture specifications.
+#
+# Each entry records the HuggingFace identifier and key architecture
+# parameters for one Pythia-deduped checkpoint. These values are
+# derived from the published HuggingFace model configs and are used
+# for programmatic lookup, shape validation, and experiment dispatch.
+
+# Common architecture fields shared across all Pythia models.
+common:
+  architecture: "GPTNeoXForCausalLM"
+  positional_embedding: "rotary"
+  parallel_attn: true
+  vocab_size: 50304
+  max_positions: 2048
+  revision: "main"
+
+models:
+  pythia-70m:
+    hf_id: "EleutherAI/pythia-70m-deduped"
+    num_layers: 6
+    hidden_size: 512
+    num_heads: 8
+    intermediate_size: 2048
+    role: "debug"
+
+  pythia-160m:
+    hf_id: "EleutherAI/pythia-160m-deduped"
+    num_layers: 12
+    hidden_size: 768
+    num_heads: 12
+    intermediate_size: 3072
+    role: "primary"
+
+  pythia-410m:
+    hf_id: "EleutherAI/pythia-410m-deduped"
+    num_layers: 24
+    hidden_size: 1024
+    num_heads: 16
+    intermediate_size: 4096
+    role: "primary"
+
+  pythia-1b:
+    hf_id: "EleutherAI/pythia-1b-deduped"
+    num_layers: 16
+    hidden_size: 2048
+    num_heads: 8
+    intermediate_size: 8192
+    role: "hcc"
+
+  pythia-2.8b:
+    hf_id: "EleutherAI/pythia-2.8b-deduped"
+    num_layers: 32
+    hidden_size: 2560
+    num_heads: 32
+    intermediate_size: 10240
+    role: "hcc"

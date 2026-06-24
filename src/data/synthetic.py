@@ -58,23 +58,27 @@ def _generate_wellformed_dyck(
     return _expand(0)
 
 
-def _corrupt_dyck(sequence: str, rng: random.Random) -> str:
+def _corrupt_dyck(sequence: str, k: int, rng: random.Random) -> str:
     """Corrupt a well-formed Dyck sequence to make it malformed.
 
     Applies one of three mutations: swap two characters, delete one
-    bracket, or insert a random bracket at a random position.
+    bracket, or insert a random bracket at a random position. Only
+    brackets from the first *k* pairs are used for insertions.
 
     Args:
         sequence: A well-formed Dyck string.
+        k: Number of bracket types in use.
         rng: Random number generator instance.
 
     Returns:
         A corrupted (malformed) Dyck string.
     """
+    pairs = _BRACKET_PAIRS[:k]
+    all_brackets = [b for pair in pairs for b in pair]
+
     chars = list(sequence)
     if len(chars) < 2:
         # Too short to corrupt meaningfully; just flip the bracket.
-        all_brackets = [b for pair in _BRACKET_PAIRS for b in pair]
         return rng.choice(all_brackets)
 
     mutation = rng.choice(["swap", "delete", "insert"])
@@ -85,7 +89,6 @@ def _corrupt_dyck(sequence: str, rng: random.Random) -> str:
     elif mutation == "delete":
         del chars[rng.randint(0, len(chars) - 1)]
     else:  # insert
-        all_brackets = [b for pair in _BRACKET_PAIRS for b in pair]
         pos = rng.randint(0, len(chars))
         chars.insert(pos, rng.choice(all_brackets))
 
@@ -93,7 +96,8 @@ def _corrupt_dyck(sequence: str, rng: random.Random) -> str:
     # If the corruption accidentally produced a valid sequence, force
     # an unmatched bracket by appending one.
     if _is_wellformed_dyck(result):
-        result += rng.choice(["(", "[", "{", "<"])
+        open_brackets = [pair[0] for pair in pairs]
+        result += rng.choice(open_brackets)
     return result
 
 
@@ -160,7 +164,7 @@ def generate_dyck(
     # Malformed examples (label=0).
     for _ in range(num_negative):
         wellformed = _generate_wellformed_dyck(k, max_depth, rng)
-        corrupted = _corrupt_dyck(wellformed, rng)
+        corrupted = _corrupt_dyck(wellformed, k, rng)
         texts.append(corrupted)
         labels.append(0)
 

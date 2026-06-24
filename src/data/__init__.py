@@ -2,11 +2,13 @@
 Data handling module.
 
 Provides task specifications, data loaders for standard HuggingFace
-datasets (SST-2, MRPC, LAMA/T-REx), and synthetic generators for
+datasets (SST-2, MRPC, LAMA/T-REx), synthetic generators for
 algorithmic and structured-knowledge tasks (Dyck-k, modular
-arithmetic, periodic table).
+arithmetic, periodic table), and a shuffled-label control generator
+for probe selectivity analysis.
 """
 
+from src.data.controls import generate_shuffled_labels
 from src.data.loaders import load_lama_trex, load_mrpc, load_sst2
 from src.data.synthetic import (
     generate_dyck,
@@ -25,4 +27,5 @@ __all__ = [
     "generate_dyck",
     "generate_modular_arithmetic",
     "generate_periodic_table",
+    "generate_shuffled_labels",
 ]

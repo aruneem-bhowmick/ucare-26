@@ -1,0 +1,50 @@
+# Task registry for early-halting experiments.
+#
+# Each entry defines a probing task with its family classification,
+# label type, number of classes, and the extraction position used
+# when collecting hidden-state representations. These specifications
+# are loaded by src/data/tasks.py and consumed by extraction and
+# probing pipelines.
+
+tasks:
+  sst2:
+    family: "shallow_semantic"
+    label_type: "classification"
+    num_classes: 2
+    extraction_position: "last_token"
+    description: "Stanford Sentiment Treebank binary sentiment classification"
+
+  mrpc:
+    family: "shallow_semantic"
+    label_type: "classification"
+    num_classes: 2
+    extraction_position: "last_token"
+    description: "Microsoft Research Paraphrase Corpus paraphrase detection"
+
+  lama_trex:
+    family: "factual_lookup"
+    label_type: "classification"
+    num_classes: null
+    extraction_position: "last_token"
+    description: "LAMA T-REx factual knowledge relation classification"
+
+  periodic_table:
+    family: "factual_lookup"
+    label_type: "regression"
+    num_classes: null
+    extraction_position: "last_token"
+    description: "Periodic table element property prediction"
+
+  dyck:
+    family: "algorithmic"
+    label_type: "classification"
+    num_classes: 2
+    extraction_position: "last_token"
+    description: "Dyck-k balanced bracket well-formedness detection"
+
+  modular_arithmetic:
+    family: "algorithmic"
+    label_type: "classification"
+    num_classes: null
+    extraction_position: "last_token"
+    description: "Modular arithmetic result prediction"

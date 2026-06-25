@@ -2,11 +2,19 @@
 Hidden state extraction module.
 
 Provides utilities for loading Pythia models and extracting intermediate
-hidden representations from transformer layers. The primary entry point
-is the smoke test, which validates that hidden state extraction works
-end-to-end for a given model.
+hidden representations from transformer layers. Includes hook-based
+capture, standalone pooling strategies, fp16 caching with safetensors
+and JSONL manifests, and an end-to-end extraction pipeline orchestrator.
 """
 
+from src.extraction.cache import (
+    load_representations,
+    save_representations,
+    verify_manifest,
+)
+from src.extraction.hooks import HookManager
+from src.extraction.pipeline import ExtractionPipeline
+from src.extraction.pooling import last_token_pool, mean_pool, pool_hidden_states
 from src.extraction.smoke_test import (
     extract_hidden_states,
     get_last_non_padding_representation,

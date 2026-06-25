@@ -22,3 +22,9 @@ extraction:
 
   # Random seed for reproducibility
   seed: 42
+
+  # Precision for cached representations
+  precision: "float16"
+
+  # Cache file format
+  cache_format: "safetensors"

@@ -17,10 +17,18 @@ Usage:
 """
 
 import logging
+import tempfile
+from pathlib import Path
 from typing import Any
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from src.data.loaders import load_sst2
+from src.extraction.cache import load_representations, save_representations, verify_manifest
+from src.extraction.hooks import HookManager
+from src.extraction.pooling import pool_hidden_states
+from src.models import get_model_spec, load_model
 
 # ---------------------------------------------------------------------------
 # Module-level constants
@@ -40,6 +48,18 @@ DEFAULT_SEED: int = 42
 
 DUMMY_SENTENCE: str = "The quick brown fox jumps over the lazy dog."
 """Short sentence used as the dummy input for the smoke test."""
+
+VALIDATION_MODEL_KEYS: list[str] = ["pythia-70m", "pythia-160m"]
+"""Model registry keys to validate in the pipeline validation."""
+
+VALIDATION_MAX_EXAMPLES: int = 16
+"""Number of SST-2 examples to use during pipeline validation."""
+
+VALIDATION_POOL_STRATEGIES: list[str] = ["last_token", "mean"]
+"""Pooling strategies to exercise during pipeline validation."""
+
+VALIDATION_BATCH_SIZE: int = 8
+"""Batch size for pipeline validation (16 examples = 2 batches)."""
 
 logger = logging.getLogger(__name__)
 
@@ -420,6 +440,306 @@ def run_smoke_test(
 
 
 # ---------------------------------------------------------------------------
+# Hook cross-check helper
+# ---------------------------------------------------------------------------
+
+
+def _cross_check_hooks_vs_output_hidden_states(
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    text: str,
+) -> None:
+    """Verify that HookManager captures the same hidden states as output_hidden_states.
+
+    Runs two forward passes on the same input — one via
+    ``output_hidden_states=True`` and one via ``HookManager`` — and
+    asserts element-wise closeness.  This confirms hook registration
+    is correct on the actual GPTNeoX model, not just mock modules.
+
+    Args:
+        model: A loaded GPTNeoX model in eval mode.
+        tokenizer: The corresponding tokenizer.
+        text: Input text to forward through the model.
+
+    Raises:
+        AssertionError: If the hidden states from the two methods diverge.
+    """
+    device = next(model.parameters()).device
+    inputs = tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=512)
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+
+    # Pass A: built-in output_hidden_states
+    with torch.no_grad():
+        outputs = model(**inputs, output_hidden_states=True)
+    reference = outputs.hidden_states
+
+    # Pass B: HookManager
+    with HookManager(model) as hm:
+        with torch.no_grad():
+            model(**inputs)
+        hooked = hm.get_hidden_states()
+
+    assert len(reference) == len(hooked), (
+        f"Layer count mismatch: output_hidden_states returned {len(reference)} "
+        f"tensors, HookManager returned {len(hooked)}"
+    )
+
+    for i in range(len(reference)):
+        assert torch.allclose(reference[i], hooked[i], atol=1e-5), (
+            f"Hidden states diverge at layer {i}: "
+            f"max diff = {(reference[i] - hooked[i]).abs().max().item():.6e}"
+        )
+
+    logger.info(
+        "Hook cross-check passed: %d layers match (atol=1e-5)",
+        len(reference),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Pipeline validation
+# ---------------------------------------------------------------------------
+
+
+def run_pipeline_validation(
+    model_keys: list[str] | None = None,
+    task_name: str = "sst2",
+    split: str = "validation",
+    max_examples: int = VALIDATION_MAX_EXAMPLES,
+    pool_strategies: list[str] | None = None,
+    output_dir: str | Path | None = None,
+    seed: int = DEFAULT_SEED,
+) -> dict[str, dict[str, Any]]:
+    """Validate the full extract -> save -> reload -> verify cycle on real models.
+
+    Runs the hook-based extraction pipeline with real Pythia checkpoints
+    and a small SST-2 subset, confirming hidden-state shapes, pooling
+    output, fp16 caching, manifest metadata, and round-trip fidelity.
+
+    Args:
+        model_keys: Registry keys to validate. Defaults to
+            ``VALIDATION_MODEL_KEYS`` (pythia-70m, pythia-160m).
+        task_name: Dataset name for manifest metadata.
+        split: Dataset split to load.
+        max_examples: Number of examples to extract.
+        pool_strategies: Pooling strategies to exercise. Defaults to
+            ``VALIDATION_POOL_STRATEGIES`` (last_token, mean).
+        output_dir: Root directory for cached artifacts. Defaults to
+            a temporary directory.
+        seed: Random seed for reproducibility.
+
+    Returns:
+        A dict keyed by ``"{model_key}/{pool_strategy}"`` with per-run
+        metadata including shapes, dtypes, and cache paths.
+    """
+    if model_keys is None:
+        model_keys = VALIDATION_MODEL_KEYS
+    if pool_strategies is None:
+        pool_strategies = VALIDATION_POOL_STRATEGIES
+
+    if output_dir is None:
+        output_dir = Path(tempfile.mkdtemp(prefix="ucare_validation_"))
+    else:
+        output_dir = Path(output_dir)
+    logger.info("Validation output directory: %s", output_dir)
+
+    set_seed(seed)
+
+    # Load dataset once (shared across models)
+    dataset = load_sst2(split=split, max_examples=max_examples, seed=seed)
+    texts = dataset["text"]
+    labels = dataset["label"]
+    example_ids = dataset["example_id"]
+    num_examples = len(texts)
+    logger.info("Loaded %d examples from SST-2 (%s)", num_examples, split)
+
+    results: dict[str, dict[str, Any]] = {}
+
+    for model_key in model_keys:
+        logger.info("=" * 60)
+        logger.info("Validating model: %s", model_key)
+        logger.info("=" * 60)
+
+        # 1. Load model spec and model
+        spec = get_model_spec(model_key)
+        model, tokenizer = load_model(spec)
+        device = next(model.parameters()).device
+
+        # 2. Cross-check hooks vs output_hidden_states on first example
+        _cross_check_hooks_vs_output_hidden_states(model, tokenizer, texts[0])
+
+        for pool_strategy in pool_strategies:
+            logger.info("--- Pool strategy: %s ---", pool_strategy)
+
+            # Accumulate across batches
+            all_pooled: dict[int, list[torch.Tensor]] = {}
+            all_token_counts: list[int] = []
+
+            for batch_start in range(0, num_examples, VALIDATION_BATCH_SIZE):
+                batch_end = min(batch_start + VALIDATION_BATCH_SIZE, num_examples)
+                batch_texts = texts[batch_start:batch_end]
+
+                # Tokenize batch
+                encoded = tokenizer(
+                    batch_texts,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=512,
+                )
+                encoded = {k: v.to(device) for k, v in encoded.items()}
+                attention_mask = encoded["attention_mask"]
+
+                # Track token counts per example
+                batch_token_counts = attention_mask.sum(dim=1).tolist()
+                all_token_counts.extend([int(c) for c in batch_token_counts])
+
+                # Hook-based extraction
+                with HookManager(model) as hm:
+                    with torch.no_grad():
+                        model(**encoded)
+                    hidden_states = hm.get_hidden_states()
+
+                # Pool hidden states
+                pooled = pool_hidden_states(
+                    hidden_states, attention_mask, strategy=pool_strategy
+                )
+
+                # Accumulate per-layer tensors
+                for layer_idx, tensor in pooled.items():
+                    if layer_idx not in all_pooled:
+                        all_pooled[layer_idx] = []
+                    all_pooled[layer_idx].append(tensor.cpu())
+
+            # Concatenate accumulated tensors
+            representations: dict[int, torch.Tensor] = {}
+            for layer_idx in sorted(all_pooled.keys()):
+                representations[layer_idx] = torch.cat(all_pooled[layer_idx], dim=0)
+
+            # ---------------------------------------------------------------
+            # Check 1 — Hidden state shapes
+            # ---------------------------------------------------------------
+            expected_num_layers = spec.num_layers + 1  # embedding + transformer blocks
+            assert len(representations) == expected_num_layers, (
+                f"Expected {expected_num_layers} layers, got {len(representations)}"
+            )
+            for layer_idx, tensor in representations.items():
+                assert tensor.shape == (num_examples, spec.hidden_size), (
+                    f"Layer {layer_idx} shape {tuple(tensor.shape)} != "
+                    f"expected ({num_examples}, {spec.hidden_size})"
+                )
+            logger.info(
+                "Check 1 PASSED: %d layers, each (%d, %d)",
+                len(representations),
+                num_examples,
+                spec.hidden_size,
+            )
+
+            # ---------------------------------------------------------------
+            # Check 2 — Pooling shapes (confirmed by assertion above)
+            # ---------------------------------------------------------------
+            logger.info(
+                "Check 2 PASSED: %s pooling produces (%d, %d) per layer",
+                pool_strategy,
+                num_examples,
+                spec.hidden_size,
+            )
+
+            # ---------------------------------------------------------------
+            # Check 3 — fp16 cache on disk
+            # ---------------------------------------------------------------
+            cache_dir = save_representations(
+                representations=representations,
+                labels=list(labels),
+                example_ids=list(example_ids),
+                token_counts=all_token_counts,
+                output_dir=output_dir,
+                model_key=model_key,
+                dataset_name=f"{task_name}_{pool_strategy}",
+                split=split,
+                pool_strategy=pool_strategy,
+                seed=seed,
+                model_revision=spec.revision,
+            )
+
+            loaded_reprs, manifest_entries = load_representations(cache_dir)
+            for layer_idx, tensor in loaded_reprs.items():
+                assert tensor.dtype == torch.float16, (
+                    f"Layer {layer_idx} dtype {tensor.dtype} != float16"
+                )
+            logger.info("Check 3 PASSED: cached files exist and dtype is float16")
+
+            # ---------------------------------------------------------------
+            # Check 4 — Manifest metadata
+            # ---------------------------------------------------------------
+            assert len(manifest_entries) == num_examples, (
+                f"Manifest has {len(manifest_entries)} entries, "
+                f"expected {num_examples}"
+            )
+            entry = manifest_entries[0]
+            assert entry["model_key"] == model_key
+            assert entry["dataset_name"] == f"{task_name}_{pool_strategy}"
+            assert entry["pool_strategy"] == pool_strategy
+            assert entry["split"] == split
+            assert entry["seed"] == seed
+            assert entry["layer_indices"] == sorted(representations.keys())
+            logger.info("Check 4 PASSED: manifest metadata is correct")
+
+            # Verify manifest consistency via verify_manifest
+            verify_manifest(cache_dir)
+
+            # ---------------------------------------------------------------
+            # Check 5 — Round-trip fidelity
+            # ---------------------------------------------------------------
+            for layer_idx in representations:
+                original_fp16 = representations[layer_idx].half()
+                loaded_tensor = loaded_reprs[layer_idx]
+                assert torch.equal(original_fp16, loaded_tensor), (
+                    f"Round-trip mismatch at layer {layer_idx}: "
+                    f"max diff = {(original_fp16 - loaded_tensor).abs().max().item():.6e}"
+                )
+            logger.info("Check 5 PASSED: round-trip fidelity confirmed")
+
+            result_key = f"{model_key}/{pool_strategy}"
+            results[result_key] = {
+                "model_key": model_key,
+                "pool_strategy": pool_strategy,
+                "num_examples": num_examples,
+                "num_layers": len(representations),
+                "hidden_size": spec.hidden_size,
+                "cache_dir": str(cache_dir),
+                "dtype": "float16",
+            }
+
+        # Free GPU memory before loading next model
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    # ---------------------------------------------------------------
+    # Check 6 — Both models validated (confirmed by outer loop)
+    # ---------------------------------------------------------------
+    logger.info("=" * 60)
+    logger.info("PIPELINE VALIDATION SUMMARY")
+    logger.info("=" * 60)
+    for key, info in results.items():
+        logger.info(
+            "  %s: %d layers x %d examples, hidden=%d, dtype=%s",
+            key,
+            info["num_layers"],
+            info["num_examples"],
+            info["hidden_size"],
+            info["dtype"],
+        )
+    logger.info("Check 6 PASSED: all %d model(s) validated", len(model_keys))
+    logger.info("=" * 60)
+    logger.info("ALL PIPELINE VALIDATION CHECKS PASSED")
+    logger.info("=" * 60)
+
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Script entry point
 # ---------------------------------------------------------------------------
 
@@ -428,4 +748,5 @@ if __name__ == "__main__":
         level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
-    results = run_smoke_test()
+    run_smoke_test()
+    run_pipeline_validation()

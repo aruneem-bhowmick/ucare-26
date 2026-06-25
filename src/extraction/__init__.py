@@ -20,6 +20,7 @@ from src.extraction.smoke_test import (
     get_last_non_padding_representation,
     get_mean_pooled_representation,
     load_model_and_tokenizer,
+    run_pipeline_validation,
     run_smoke_test,
     set_seed,
     validate_hidden_states,

@@ -1,0 +1,40 @@
+# Linear probing configuration for layer-wise decodability analysis.
+#
+# Controls probe algorithm selection, regularization sweep, and
+# cross-validation settings consumed by src/probing (the linear
+# probe wrapper, cross-validation harness, selectivity analysis,
+# and per-layer probing pipeline).
+
+probe:
+  # Estimator for classification tasks (strictly linear).
+  classification: "logistic_regression"
+
+  # Estimator for regression tasks. "linear_svr" is an available
+  # alternative to ridge for tasks where it fits better.
+  regression: "ridge"
+
+  # Standardize features (zero mean, unit variance) before fitting.
+  # Always fit on the training fold only, never on held-out data.
+  standardize: true
+
+  # Class balancing strategy for classification tasks.
+  class_weight: "balanced"
+
+  # Regularization values swept by the cross-validation harness.
+  # Interpreted as C (inverse strength) for logistic_regression and
+  # linear_svr, and as alpha (direct strength) for ridge.
+  regularization_grid: [0.001, 0.01, 0.1, 1.0, 10.0]
+
+cv:
+  # Number of cross-validation folds.
+  folds: 5
+
+  # Random seed for fold splitting and reproducibility.
+  seed: 42
+
+# Models and tasks to probe.
+models: ["pythia-160m"]
+tasks: ["sst2", "lama_trex"]
+
+# Output directory for probing result tables.
+output_dir: "outputs/probing"

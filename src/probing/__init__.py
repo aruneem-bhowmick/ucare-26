@@ -1,7 +1,13 @@
 """
 Linear probing module.
 
-Will provide linear probe classifiers for evaluating the linear
+Provides linear probe classifiers for evaluating the linear
 decodability of task-relevant information across transformer layers.
-To be implemented in subsequent project phases.
 """
+
+from src.probing.probes import LinearProbe, load_probing_config
+
+__all__ = [
+    "LinearProbe",
+    "load_probing_config",
+]

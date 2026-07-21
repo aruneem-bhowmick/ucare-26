@@ -115,6 +115,9 @@ def run_cross_validated_probe(
     splits = list(splitter.split(X, y_arr))
 
     def _make_probe(regularization: float) -> LinearProbe:
+        """Construct an unfitted LinearProbe at the given regularization,
+        using the standardize/class_weight/algorithm settings from
+        the enclosing config and the enclosing cross-validation seed."""
         return LinearProbe(
             task_spec,
             regularization=regularization,

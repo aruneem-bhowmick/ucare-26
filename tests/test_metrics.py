@@ -1,10 +1,12 @@
 """
-Tests for probing metrics: classification margin and expected calibration
-error.
+Tests for probing metrics: classification margin, expected calibration
+error, and prediction depth.
 
 Validates margin sign and formula correctness for both binary and
-multi-class probes, and expected calibration error on constructed
-perfectly-calibrated and miscalibrated confidence distributions.
+multi-class probes, expected calibration error on constructed
+perfectly-calibrated and miscalibrated confidence distributions, and
+prediction-depth correctness on constructed stable and unstable
+per-layer prediction sequences.
 """
 
 from typing import Any
@@ -17,6 +19,7 @@ from sklearn.datasets import make_classification, make_regression
 from src.data.tasks import TaskSpec
 from src.metrics.calibration import expected_calibration_error
 from src.metrics.margins import classification_margin
+from src.metrics.prediction_depth import prediction_depth
 from src.probing.probes import LinearProbe
 
 
@@ -372,3 +375,62 @@ class TestExpectedCalibrationError:
         probe = LinearProbe(binary_classification_task).fit(X, y)
         ece = expected_calibration_error(probe, X, y, n_bins=5)
         assert 0.0 <= ece <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# TestPredictionDepth
+# ---------------------------------------------------------------------------
+
+
+class TestPredictionDepth:
+    """Tests for prediction_depth on constructed per-layer prediction
+    sequences."""
+
+    def test_all_layers_agree_returns_zero(self) -> None:
+        """A sequence that never changes should stabilize at layer 0."""
+        assert prediction_depth([1, 1, 1, 1]) == 0
+
+    def test_stabilizes_partway_through(self) -> None:
+        """The depth should be the first layer of the run that matches
+        the final layer's prediction, ignoring earlier layers."""
+        assert prediction_depth([0, 0, 1, 1, 1]) == 2
+
+    def test_only_final_layer_matches_itself(self) -> None:
+        """When every layer but the last disagrees with the final
+        prediction, depth should fall back to the deepest layer."""
+        assert prediction_depth([0, 0, 0, 1]) == 3
+
+    def test_single_layer_returns_zero(self) -> None:
+        """A single-layer sequence trivially stabilizes at layer 0."""
+        assert prediction_depth([7]) == 0
+
+    def test_ignores_matches_broken_by_an_intervening_mismatch(self) -> None:
+        """An early layer that happens to match the final prediction
+        should not count if a later layer breaks the run — only the
+        contiguous suffix matters."""
+        assert prediction_depth([1, 0, 1, 1, 1]) == 2
+
+    def test_empty_sequence_raises(self) -> None:
+        """An empty prediction sequence has no layers to scan."""
+        with pytest.raises(ValueError):
+            prediction_depth([])
+
+    def test_explicit_final_prediction_overrides_default(self) -> None:
+        """An explicit final_prediction that differs from the sequence's
+        last element should be used as the comparison target."""
+        assert prediction_depth([5, 5, 3, 3], final_prediction=5) == 3
+
+    def test_explicit_final_prediction_matching_default_behaves_the_same(self) -> None:
+        """Passing the sequence's own last element as final_prediction
+        should behave identically to the default."""
+        assert prediction_depth([0, 0, 1, 1, 1], final_prediction=1) == 2
+
+    def test_works_with_non_numeric_labels(self) -> None:
+        """Predictions may be arbitrary class labels, not just integers."""
+        assert prediction_depth(["cat", "cat", "dog", "dog"]) == 2
+
+    def test_returns_python_int(self) -> None:
+        """The returned depth should be a plain int, regardless of the
+        prediction sequence's element type."""
+        depth = prediction_depth(np.array([0, 0, 1, 1]))
+        assert isinstance(depth, int)

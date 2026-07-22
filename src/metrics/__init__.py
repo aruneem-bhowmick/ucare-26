@@ -1,7 +1,15 @@
 """
 Evaluation metrics module.
 
-Will provide metrics for measuring representation geometry, including
-intrinsic dimensionality, residual-stream stability, and probe accuracy
-across layers. To be implemented in subsequent project phases.
+Provides layer-wise probing diagnostics — classification margin and
+expected calibration error — that quantify probe separability and
+confidence calibration beyond raw probe accuracy.
 """
+
+from src.metrics.calibration import expected_calibration_error
+from src.metrics.margins import classification_margin
+
+__all__ = [
+    "classification_margin",
+    "expected_calibration_error",
+]

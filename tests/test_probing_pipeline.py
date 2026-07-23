@@ -133,11 +133,13 @@ def _make_regression_cache(
 
 @pytest.fixture
 def classification_cache_dir(tmp_path: Path) -> Path:
+    """A real cache directory for a layer-separable binary-label task."""
     return _make_classification_cache(tmp_path)
 
 
 @pytest.fixture
 def regression_cache_dir(tmp_path: Path) -> Path:
+    """A real cache directory for a continuous-label regression task."""
     return _make_regression_cache(tmp_path)
 
 

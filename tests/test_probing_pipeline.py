@@ -9,6 +9,7 @@ table's schema and row count, per-layer aggregation correctness, CSV
 output, and prediction-depth aggregation.
 """
 
+import csv
 import json
 from pathlib import Path
 from typing import Any
@@ -19,11 +20,13 @@ import torch
 from safetensors.torch import save_file
 
 from src.extraction.cache import save_representations
+from src.metrics.prediction_depth import prediction_depth
 from src.probing.pipeline import (
     ProbingPipeline,
     RESULT_COLUMNS,
     _group_by_pool_strategy,
     _select_rows,
+    _stack_prediction_depths,
 )
 
 
@@ -136,6 +139,70 @@ def classification_cache_dir(tmp_path: Path) -> Path:
 @pytest.fixture
 def regression_cache_dir(tmp_path: Path) -> Path:
     return _make_regression_cache(tmp_path)
+
+
+def _make_multi_pool_strategy_cache(
+    tmp_path: Path,
+    n_per_group: int = 20,
+    hidden: int = HIDDEN_SIZE,
+    layer_indices: tuple[int, ...] = (0, 1),
+) -> Path:
+    """Build a cache directory with two pool strategies in one manifest.
+
+    The public save_representations API always writes a single
+    pool_strategy per call (and truncates the manifest on each call,
+    so calling it twice cannot accumulate multiple strategies), so
+    this writes the safetensors/manifest files directly to construct
+    a cache shape that is a valid (if not currently produced) input
+    to the pipeline: multiple pool strategies sharing one cache
+    directory.
+    """
+    cache_dir = tmp_path / "multi_pool_cache"
+    cache_dir.mkdir()
+
+    rng = np.random.default_rng(2)
+    manifest_entries: list[dict[str, Any]] = []
+    tensors_by_layer: dict[int, list[torch.Tensor]] = {l: [] for l in layer_indices}
+    example_id = 0
+
+    for pool_strategy in ("last_token", "mean"):
+        y = [0] * (n_per_group // 2) + [1] * (n_per_group // 2)
+        y_arr = np.array(y)
+        for layer in layer_indices:
+            separation = layer * 2.0
+            X = rng.normal(size=(n_per_group, hidden)).astype(np.float32)
+            X[:, 0] += separation * y_arr
+            tensors_by_layer[layer].append(torch.tensor(X))
+        for i in range(n_per_group):
+            manifest_entries.append(
+                {
+                    "example_id": example_id,
+                    "label": y[i],
+                    "token_count": 5,
+                    "layer_indices": list(layer_indices),
+                    "pool_strategy": pool_strategy,
+                    "model_key": "mock-model",
+                    "model_revision": "main",
+                    "dataset_name": "sst2",
+                    "split": "validation",
+                    "seed": 42,
+                    "torch_version": torch.__version__,
+                }
+            )
+            example_id += 1
+
+    for layer in layer_indices:
+        tensor = torch.cat(tensors_by_layer[layer], dim=0)
+        save_file(
+            {"representations": tensor.half().contiguous()},
+            str(cache_dir / f"layer_{layer:02d}.safetensors"),
+        )
+
+    with open(cache_dir / "manifest.jsonl", "w") as f:
+        for entry in manifest_entries:
+            f.write(json.dumps(entry) + "\n")
+
+    return cache_dir
 
 
 # ---------------------------------------------------------------------------
@@ -298,3 +365,173 @@ class TestProbingPipelineAggregation:
         rows = pipeline.run(regression_cache_dir)
         for row in rows:
             assert row["score"] <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# TestStackPredictionDepths
+# ---------------------------------------------------------------------------
+
+
+class TestStackPredictionDepths:
+    """Tests for the per-layer-prediction stacking helper."""
+
+    def test_matches_manual_prediction_depth_per_example(self) -> None:
+        """Depths should equal prediction_depth applied to each example's
+        own sequence of per-layer predictions, in layer order."""
+        layer_predictions = {
+            0: np.array([0, 1, 0]),
+            1: np.array([0, 0, 0]),
+            2: np.array([1, 0, 0]),
+        }
+        layer_indices = [0, 1, 2]
+
+        depths = _stack_prediction_depths(layer_predictions, layer_indices)
+
+        expected = [
+            prediction_depth([0, 0, 1]),  # example 0
+            prediction_depth([1, 0, 0]),  # example 1
+            prediction_depth([0, 0, 0]),  # example 2
+        ]
+        np.testing.assert_array_equal(depths, expected)
+
+    def test_respects_layer_index_order_not_dict_insertion_order(self) -> None:
+        """The sequence passed to prediction_depth must follow
+        layer_indices, even if the dict was populated out of order."""
+        layer_predictions = {
+            2: np.array([1]),
+            0: np.array([1]),
+            1: np.array([0]),
+        }
+        depths = _stack_prediction_depths(layer_predictions, [0, 1, 2])
+        assert depths[0] == prediction_depth([1, 0, 1])
+
+    def test_returns_one_depth_per_example(self) -> None:
+        """Output length should match the number of examples, not the
+        number of layers."""
+        layer_predictions = {0: np.zeros(7), 1: np.zeros(7)}
+        depths = _stack_prediction_depths(layer_predictions, [0, 1])
+        assert depths.shape == (7,)
+
+
+# ---------------------------------------------------------------------------
+# TestProbingPipelineOutput
+# ---------------------------------------------------------------------------
+
+
+class TestProbingPipelineOutput:
+    """Tests for CSV persistence of the tidy result table."""
+
+    def test_writes_csv_to_expected_path(
+        self, classification_cache_dir: Path, probing_config: dict[str, Any]
+    ) -> None:
+        """The output file should follow {output_dir}/{model}_{task}.csv."""
+        pipeline = ProbingPipeline("mock-model", "sst2", probing_config)
+        pipeline.run(classification_cache_dir)
+
+        expected_path = Path(probing_config["output_dir"]) / "mock-model_sst2.csv"
+        assert expected_path.exists()
+
+    def test_creates_output_directory_if_missing(
+        self, classification_cache_dir: Path, probing_config: dict[str, Any]
+    ) -> None:
+        """output_dir need not exist beforehand."""
+        assert not Path(probing_config["output_dir"]).exists()
+        pipeline = ProbingPipeline("mock-model", "sst2", probing_config)
+        pipeline.run(classification_cache_dir)
+        assert Path(probing_config["output_dir"]).exists()
+
+    def test_csv_contents_match_returned_rows(
+        self, classification_cache_dir: Path, probing_config: dict[str, Any]
+    ) -> None:
+        """Reading the written CSV back should reproduce the same rows
+        (as strings) that run() returned."""
+        pipeline = ProbingPipeline("mock-model", "sst2", probing_config)
+        rows = pipeline.run(classification_cache_dir)
+
+        csv_path = Path(probing_config["output_dir"]) / "mock-model_sst2.csv"
+        with open(csv_path, newline="") as f:
+            reader = csv.DictReader(f)
+            csv_rows = list(reader)
+
+        assert len(csv_rows) == len(rows)
+        for csv_row, row in zip(csv_rows, rows):
+            for column in RESULT_COLUMNS:
+                assert csv_row[column] == str(row[column])
+
+    def test_csv_header_matches_result_columns(
+        self, classification_cache_dir: Path, probing_config: dict[str, Any]
+    ) -> None:
+        """The CSV header row should exactly match RESULT_COLUMNS, in
+        order."""
+        pipeline = ProbingPipeline("mock-model", "sst2", probing_config)
+        pipeline.run(classification_cache_dir)
+
+        csv_path = Path(probing_config["output_dir"]) / "mock-model_sst2.csv"
+        with open(csv_path, newline="") as f:
+            header = next(csv.reader(f))
+        assert header == RESULT_COLUMNS
+
+
+# ---------------------------------------------------------------------------
+# TestProbingPipelineMultiPoolStrategy
+# ---------------------------------------------------------------------------
+
+
+class TestProbingPipelineMultiPoolStrategy:
+    """Integration tests for a cache directory holding multiple pool
+    strategies, exercising the (layer, pool_strategy) iteration in full."""
+
+    def test_row_count_covers_every_combination(
+        self, tmp_path: Path, probing_config: dict[str, Any]
+    ) -> None:
+        """Two pool strategies x two layers should produce four rows."""
+        cache_dir = _make_multi_pool_strategy_cache(tmp_path, layer_indices=(0, 1))
+        pipeline = ProbingPipeline("mock-model", "sst2", probing_config)
+        rows = pipeline.run(cache_dir)
+        assert len(rows) == 4
+
+    def test_both_pool_strategies_present(
+        self, tmp_path: Path, probing_config: dict[str, Any]
+    ) -> None:
+        """Both pool_strategy values from the manifest should appear in
+        the result table."""
+        cache_dir = _make_multi_pool_strategy_cache(tmp_path, layer_indices=(0, 1))
+        pipeline = ProbingPipeline("mock-model", "sst2", probing_config)
+        rows = pipeline.run(cache_dir)
+        assert {row["pool_strategy"] for row in rows} == {"last_token", "mean"}
+
+    def test_prediction_depth_mean_constant_within_each_pool_strategy(
+        self, tmp_path: Path, probing_config: dict[str, Any]
+    ) -> None:
+        """prediction_depth_mean is a whole-trajectory summary, so every
+        layer row for a given pool strategy should carry the same
+        value, independent of the other pool strategy's value."""
+        cache_dir = _make_multi_pool_strategy_cache(tmp_path, layer_indices=(0, 1))
+        pipeline = ProbingPipeline("mock-model", "sst2", probing_config)
+        rows = pipeline.run(cache_dir)
+
+        by_strategy: dict[str, set[float]] = {}
+        for row in rows:
+            by_strategy.setdefault(row["pool_strategy"], set()).add(
+                row["prediction_depth_mean"]
+            )
+
+        for depth_values in by_strategy.values():
+            assert len(depth_values) == 1
+
+    def test_pool_strategies_do_not_leak_examples_into_each_other(
+        self, tmp_path: Path, probing_config: dict[str, Any]
+    ) -> None:
+        """Each pool strategy's probe should only ever see its own
+        examples: swapping which strategy is queried first should not
+        change either strategy's score."""
+        cache_dir = _make_multi_pool_strategy_cache(tmp_path, layer_indices=(0, 1))
+        pipeline_a = ProbingPipeline("mock-model", "sst2", probing_config)
+        rows_a = pipeline_a.run(cache_dir)
+
+        pipeline_b = ProbingPipeline("mock-model", "sst2", probing_config)
+        rows_b = pipeline_b.run(cache_dir)
+
+        scores_a = {(r["pool_strategy"], r["layer"]): r["score"] for r in rows_a}
+        scores_b = {(r["pool_strategy"], r["layer"]): r["score"] for r in rows_b}
+        assert scores_a == scores_b

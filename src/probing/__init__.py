@@ -17,3 +17,10 @@ __all__ = [
     "load_probing_config",
     "run_cross_validated_probe",
 ]
+
+# ProbingPipeline is intentionally not re-exported here: it imports
+# from src.metrics, and src.metrics.calibration/margins import from
+# src.probing.probes, so pulling it into this package's own __init__
+# would make src.probing and src.metrics import-order-dependent on
+# each other. Import it directly: from src.probing.pipeline import
+# ProbingPipeline.

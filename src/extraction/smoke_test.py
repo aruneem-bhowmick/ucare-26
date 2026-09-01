@@ -456,6 +456,18 @@ def _cross_check_hooks_vs_output_hidden_states(
     asserts element-wise closeness.  This confirms hook registration
     is correct on the actual GPTNeoX model, not just mock modules.
 
+    HuggingFace's ``output_hidden_states`` convention applies
+    ``final_layer_norm`` to only its *last* tuple entry (every other
+    entry is a raw pre-block/post-block residual). ``HookManager``
+    intentionally captures the raw, un-normalized residual stream at
+    every layer, including the last, so that every layer shares one
+    consistent definition — normalizing only the final layer would
+    inject an artificial discontinuity exactly where later
+    residual-stream stability metrics (cosine similarity between
+    consecutive layers, Jacobian norms) are most sensitive to it. The
+    last layer is therefore checked against
+    ``final_layer_norm(hooked[-1])`` instead of raw equality.
+
     Args:
         model: A loaded GPTNeoX model in eval mode.
         tokenizer: The corresponding tokenizer.
@@ -484,14 +496,19 @@ def _cross_check_hooks_vs_output_hidden_states(
         f"tensors, HookManager returned {len(hooked)}"
     )
 
+    last = len(reference) - 1
     for i in range(len(reference)):
-        assert torch.allclose(reference[i], hooked[i], atol=1e-5), (
+        expected = (
+            model.gpt_neox.final_layer_norm(hooked[i]) if i == last else hooked[i]
+        )
+        assert torch.allclose(reference[i], expected, atol=1e-5), (
             f"Hidden states diverge at layer {i}: "
-            f"max diff = {(reference[i] - hooked[i]).abs().max().item():.6e}"
+            f"max diff = {(reference[i] - expected).abs().max().item():.6e}"
         )
 
     logger.info(
-        "Hook cross-check passed: %d layers match (atol=1e-5)",
+        "Hook cross-check passed: %d layers match (atol=1e-5, last layer "
+        "compared post-final_layer_norm by design)",
         len(reference),
     )
 

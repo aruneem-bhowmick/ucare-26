@@ -146,8 +146,8 @@ def _make_mock_lama_trex(num_examples: int = 12) -> Dataset:
     """Create a mock LAMA T-REx dataset matching the HF schema."""
     predicates = ["P17", "P19", "P36"]
     return Dataset.from_dict({
-        "masked_sentences": [
-            [f"Subject {i} is located in [MASK] country."]
+        "masked_sentence": [
+            f"Subject {i} is located in [MASK] country."
             for i in range(num_examples)
         ],
         "obj_label": [f"Object_{i}" for i in range(num_examples)],

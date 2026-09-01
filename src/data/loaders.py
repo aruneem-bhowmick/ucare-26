@@ -97,7 +97,13 @@ def load_lama_trex(
 ) -> Dataset:
     """Load the LAMA T-REx factual knowledge probing dataset.
 
-    Source: ``datasets.load_dataset("lama", "trex")``.
+    Source: ``datasets.load_dataset("KimByeongSu/lama-trex-no-duplicate")``,
+    a Parquet re-upload of the original Petroni et al. (2019) LAMA/T-REx
+    probe set (same fields, same 41 relations, 701,931 rows). The
+    original ``load_dataset("lama", "trex")`` loader script is no
+    longer usable: recent ``datasets`` releases (5.x) dropped support
+    for script-based dataset loading entirely, regardless of
+    ``trust_remote_code``.
 
     For each example the ``masked_sentence`` is truncated at the
     ``[MASK]`` token to form a prompt. The ``predicate_id`` strings
@@ -116,7 +122,7 @@ def load_lama_trex(
         ``example_id``, ``obj_label``, ``sub_label``,
         ``predicate_id``.
     """
-    ds = load_dataset("lama", "trex", split=split)
+    ds = load_dataset("KimByeongSu/lama-trex-no-duplicate", split=split)
 
     if relations is not None:
         ds = ds.filter(lambda ex: ex["predicate_id"] in set(relations))
@@ -128,7 +134,7 @@ def load_lama_trex(
     }
 
     def _transform(example: dict, idx: int) -> dict:
-        masked = example["masked_sentences"][0]
+        masked = example["masked_sentence"]
         # Truncate at [MASK] to form the prompt.
         mask_pos = masked.find("[MASK]")
         if mask_pos >= 0:

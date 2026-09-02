@@ -1,0 +1,13 @@
+family,task,model,depth_to_90pct_ceiling,ceiling_score
+factual_lookup,lama_trex,pythia-70m,0.16666666666666666,0.8446666666666667
+factual_lookup,lama_trex,pythia-160m,0.16666666666666666,0.8673333333333332
+factual_lookup,periodic_table,pythia-70m,0.16666666666666666,0.6055317068099976
+factual_lookup,periodic_table,pythia-160m,0.08333333333333333,0.6337684297561645
+shallow_semantic,sst2,pythia-70m,0.16666666666666666,0.716
+shallow_semantic,sst2,pythia-160m,0.16666666666666666,0.742
+shallow_semantic,mrpc,pythia-70m,0.3333333333333333,0.644
+shallow_semantic,mrpc,pythia-160m,0.25,0.6973333333333334
+algorithmic,dyck,pythia-70m,0.16666666666666666,0.6789999999999999
+algorithmic,dyck,pythia-160m,0.08333333333333333,0.6849999999999999
+algorithmic,modular_arithmetic,pythia-70m,0.5,0.9802857142857143
+algorithmic,modular_arithmetic,pythia-160m,0.16666666666666666,0.9811428571428572

@@ -6,6 +6,7 @@ schema (``text``, ``label``, ``example_id``) so that downstream
 extraction and probing code can treat every task uniformly.
 """
 
+import itertools
 import logging
 import random
 
@@ -58,12 +59,91 @@ def _generate_wellformed_dyck(
     return _expand(0)
 
 
-def _corrupt_dyck(sequence: str, k: int, rng: random.Random) -> str:
-    """Corrupt a well-formed Dyck sequence to make it malformed.
+def _swap_until_malformed(
+    chars: list[str], positions: list[int], rng: random.Random
+) -> str | None:
+    """Permute two of *positions* in *chars* until the result is malformed.
 
-    Applies one of three mutations: swap two characters, delete one
-    bracket, or insert a random bracket at a random position. Only
-    brackets from the first *k* pairs are used for insertions.
+    Exhaustively tries every distinct pair of *positions* (order
+    randomized), then every combination of two distinct pairs, before
+    giving up. Every attempt is verified with ``_is_wellformed_dyck``
+    rather than assumed: a permutation that is not the identity can
+    still coincidentally rearrange a symmetric or repetitive structure
+    into a *different* well-formed string (e.g. ``"()()()"`` has
+    several well-formed rearrangements among its interior swaps), so
+    "not equal to the original" is not a valid proxy for "malformed."
+
+    Args:
+        chars: The sequence to permute, as a list of characters.
+        positions: Candidate indices into *chars*.
+        rng: Random number generator instance.
+
+    Returns:
+        A malformed permutation of *chars*, joined back into a
+        string, or ``None`` if no single swap or composition of two
+        swaps among *positions* breaks well-formedness.
+    """
+    pairs = list(itertools.combinations(positions, 2))
+    rng.shuffle(pairs)
+
+    for i, j in pairs:
+        candidate = chars.copy()
+        candidate[i], candidate[j] = candidate[j], candidate[i]
+        result = "".join(candidate)
+        if not _is_wellformed_dyck(result):
+            return result
+
+    # No single swap broke well-formedness. Try composing two distinct
+    # swaps, verifying each composition rather than assuming it works.
+    for (i1, j1), (i2, j2) in itertools.combinations(pairs, 2):
+        candidate = chars.copy()
+        candidate[i1], candidate[j1] = candidate[j1], candidate[i1]
+        candidate[i2], candidate[j2] = candidate[j2], candidate[i2]
+        result = "".join(candidate)
+        if not _is_wellformed_dyck(result):
+            return result
+
+    return None
+
+
+def _corrupt_dyck(sequence: str, k: int, rng: random.Random) -> str:
+    """Corrupt a well-formed Dyck sequence into a malformed one.
+
+    Primary strategy: permute existing characters (never insert or
+    delete), so the corrupted sequence has exactly the same length and
+    exactly the same bracket-character multiset as its well-formed
+    source. This matters for probing: a corruption scheme that changes
+    sequence length or per-bracket-type counts hands a linear probe a
+    trivial surface-level shortcut, bracket-count or length parity,
+    that is linearly present even in the raw embedding layer, before
+    any nesting-order computation has happened.
+
+    Swaps are restricted to *interior* positions (excluding the first
+    and last character) whenever at least three exist, which
+    additionally preserves the first and last character. This matters
+    specifically for last-token pooling: a well-formed Dyck string can
+    never end in an opening bracket, so a swap that is free to touch
+    the last position hands the probe an even cheaper shortcut than a
+    length/count feature, reading malformedness off a single token's
+    identity with no computation at all.
+
+    Fallback strategy, for sequences too short to have enough interior
+    positions (the generator does produce these, e.g. ``"()"`` at its
+    minimum, and the resulting malformed set would otherwise be biased
+    toward them): delete the first character instead of permuting.
+    This is always guaranteed malformed, the opening bracket at
+    position 0 must be matched by some later closing bracket for the
+    source to be well-formed, and deleting it leaves that closing
+    bracket to find an empty stack, while leaving the *last* character
+    untouched, so it cannot create the boundary-identity shortcut a
+    full-sequence swap risks. The tradeoff is a one-character length
+    change, which is acceptable here specifically because Pythia/
+    GPT-NeoX uses rotary position embeddings, injected inside
+    attention rather than baked into the raw token embedding, so the
+    embedding layer (layer 0) has no positional information to read a
+    length cue from at all; a length perturbation only becomes visible
+    once a later layer has incorporated position, by which point
+    detecting it is no longer free.
 
     Args:
         sequence: A well-formed Dyck string.
@@ -71,34 +151,40 @@ def _corrupt_dyck(sequence: str, k: int, rng: random.Random) -> str:
         rng: Random number generator instance.
 
     Returns:
-        A corrupted (malformed) Dyck string.
+        A corrupted (malformed) Dyck string. Same length and
+        bracket-character multiset as *sequence*, and the same first
+        and last character, when a permutation among interior
+        positions succeeds; otherwise one character shorter, missing
+        the first character, with the last character preserved.
     """
-    pairs = _BRACKET_PAIRS[:k]
-    all_brackets = [b for pair in pairs for b in pair]
-
     chars = list(sequence)
-    if len(chars) < 2:
-        # Too short to corrupt meaningfully; just flip the bracket.
-        return rng.choice(all_brackets)
+    n = len(chars)
+    interior = list(range(1, n - 1))
+    result: str | None = None
 
-    mutation = rng.choice(["swap", "delete", "insert"])
+    if len(interior) >= 3:
+        result = _swap_until_malformed(chars, interior, rng)
+    elif len(interior) == 2:
+        i, j = interior
+        candidate = chars.copy()
+        candidate[i], candidate[j] = candidate[j], candidate[i]
+        candidate_str = "".join(candidate)
+        if not _is_wellformed_dyck(candidate_str):
+            result = candidate_str
+        # Else: the lone interior swap happened to preserve well-formedness
+        # (e.g. "{}{}" -> "{{}}") and there is no second interior pair
+        # to compose with. Fall through to the boundary-safe deletion
+        # below rather than risk a boundary-breaking full-sequence swap.
 
-    if mutation == "swap":
-        i, j = rng.sample(range(len(chars)), 2)
-        chars[i], chars[j] = chars[j], chars[i]
-    elif mutation == "delete":
-        del chars[rng.randint(0, len(chars) - 1)]
-    else:  # insert
-        pos = rng.randint(0, len(chars))
-        chars.insert(pos, rng.choice(all_brackets))
+    if result is not None:
+        return result
 
-    result = "".join(chars)
-    # If the corruption accidentally produced a valid sequence, force
-    # an unmatched bracket by appending one.
-    if _is_wellformed_dyck(result):
-        open_brackets = [pair[0] for pair in pairs]
-        result += rng.choice(open_brackets)
-    return result
+    if n >= 2:
+        return "".join(chars[1:])
+
+    # Too short to corrupt meaningfully at all.
+    pairs = _BRACKET_PAIRS[:k]
+    return rng.choice([b for pair in pairs for b in pair])
 
 
 def _is_wellformed_dyck(sequence: str) -> bool:
@@ -134,6 +220,22 @@ def generate_dyck(
     Produces a 50/50 split of well-formed (label=1) and malformed
     (label=0) bracket sequences using ``k`` bracket types.
 
+    Characters in ``text`` are space-separated (e.g. ``"( ( ) )"``
+    rather than ``"(())"``). Pythia/GPT-NeoX's BPE tokenizer merges
+    runs of identical or adjacent bracket characters into single
+    multi-character tokens (e.g. ``"((()))"`` tokenizes with a final
+    token spanning four characters, ``"()))"'``), so the model's
+    last-token representation can depend on several trailing
+    characters at once even when the corruption logic guarantees the
+    last *character* is unchanged. Random interior permutation tends
+    to break up the long same-bracket runs that the recursive
+    generator naturally produces, shifting token boundaries near the
+    end of the sequence and leaking a residual well-formedness signal
+    into the raw embedding layer. Space-separating forces one bracket
+    per token, so last-token identity depends only on the literal last
+    character, matching the guarantee ``_corrupt_dyck`` already makes
+    at the character level.
+
     Args:
         k: Number of bracket types (1..4).
         num_examples: Total number of examples to generate.
@@ -158,14 +260,14 @@ def generate_dyck(
     # Well-formed examples (label=1).
     for _ in range(num_positive):
         seq = _generate_wellformed_dyck(k, max_depth, rng)
-        texts.append(seq)
+        texts.append(" ".join(seq))
         labels.append(1)
 
     # Malformed examples (label=0).
     for _ in range(num_negative):
         wellformed = _generate_wellformed_dyck(k, max_depth, rng)
         corrupted = _corrupt_dyck(wellformed, k, rng)
-        texts.append(corrupted)
+        texts.append(" ".join(corrupted))
         labels.append(0)
 
     # Shuffle so positive and negative are interleaved.

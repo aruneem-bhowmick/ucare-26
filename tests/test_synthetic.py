@@ -6,12 +6,16 @@ output schema for Dyck-k, modular arithmetic, and periodic table
 generators.
 """
 
+import random
 import re
+from collections import Counter
 
 import pytest
 from datasets import Dataset
 
 from src.data.synthetic import (
+    _corrupt_dyck,
+    _generate_wellformed_dyck,
     _is_wellformed_dyck,
     generate_dyck,
     generate_modular_arithmetic,
@@ -88,17 +92,68 @@ class TestGenerateDyck:
         """With k=1, only parentheses should appear."""
         ds = generate_dyck(k=1, num_examples=50, seed=42)
         for text in ds["text"]:
-            # Only ( and ) should appear, no other bracket types
+            # Only ( and ) should appear (text is space-separated for
+            # tokenization; whitespace is not a disallowed bracket).
             allowed = set("()")
-            brackets_in_text = set(ch for ch in text if not ch.isalnum())
+            brackets_in_text = set(
+                ch for ch in text if not ch.isalnum() and not ch.isspace()
+            )
             assert brackets_in_text <= allowed, (
                 f"k=1 sequence contains disallowed brackets: {text!r}"
             )
+
+    def test_text_is_space_separated(self) -> None:
+        """text should have exactly one space between each bracket
+        character, so the tokenizer cannot merge adjacent brackets
+        into a single multi-character token."""
+        ds = generate_dyck(k=3, num_examples=20, seed=42)
+        for text in ds["text"]:
+            assert text == " ".join(text.split(" "))
+            chars = text.split(" ")
+            assert all(len(c) == 1 for c in chars)
 
     def test_example_ids_sequential(self) -> None:
         """Example IDs should be sequential starting from 0."""
         ds = generate_dyck(k=2, num_examples=20)
         assert ds["example_id"] == list(range(20))
+
+    def test_corruption_preserves_length_and_char_counts_when_long_enough(
+        self,
+    ) -> None:
+        """When the source has at least three interior positions
+        (length >= 5), corruption must permute rather than delete: a
+        linear probe should only be able to recover the well-formedness
+        label from character *order*, never from a raw count or length
+        feature computable at the embedding layer alone."""
+        rng = random.Random(7)
+        for _ in range(50):
+            wellformed = _generate_wellformed_dyck(k=3, max_depth=5, rng=rng)
+            corrupted = _corrupt_dyck(wellformed, k=3, rng=rng)
+            assert not _is_wellformed_dyck(corrupted)
+            if len(wellformed) >= 5:
+                assert len(corrupted) == len(wellformed)
+                assert Counter(corrupted) == Counter(wellformed)
+
+    def test_corruption_preserves_last_character_always(self) -> None:
+        """Corrupted sequences must always keep the same last character
+        as their well-formed source, regardless of source length.
+        Last-token pooling would otherwise let a probe read
+        well-formedness off the final token alone (a well-formed
+        sequence can never end in an opening bracket), which requires
+        no structural computation at all. Sources long enough to swap
+        among interior positions (length >= 5) also keep the first
+        character and the exact length; shorter sources fall back to
+        deleting the first character instead, which is one character
+        shorter but still never touches the last character."""
+        rng = random.Random(11)
+        for _ in range(50):
+            wellformed = _generate_wellformed_dyck(k=3, max_depth=5, rng=rng)
+            corrupted = _corrupt_dyck(wellformed, k=3, rng=rng)
+            assert corrupted[-1] == wellformed[-1]
+            assert len(corrupted) in (len(wellformed), len(wellformed) - 1)
+            if len(wellformed) >= 5:
+                assert corrupted[0] == wellformed[0]
+                assert len(corrupted) == len(wellformed)
 
 
 # ---------------------------------------------------------------------------

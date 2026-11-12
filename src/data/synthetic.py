@@ -3,7 +3,8 @@ Synthetic data generators for algorithmic and structured-knowledge tasks.
 
 Each generator produces a ``datasets.Dataset`` with the standardized
 schema (``text``, ``label``, ``example_id``) so that downstream
-extraction and probing code can treat every task uniformly.
+extraction and probing code can treat every task uniformly. Dyck-k
+adds a ``violation`` column (see ``generate_dyck``).
 """
 
 import itertools
@@ -59,6 +60,31 @@ def _generate_wellformed_dyck(
     return _expand(0)
 
 
+def _has_mismatched_adjacent_pair(sequence: str) -> bool:
+    """Whether *sequence* has an opener directly followed by a closer
+    of a different type (e.g. ``"[)"``), which no well-formed string has.
+
+    Args:
+        sequence: A string of bracket characters.
+
+    Returns:
+        ``True`` if any adjacent opener/closer pair mismatches in type.
+    """
+    match = dict(_BRACKET_PAIRS)
+    closes = set(match.values())
+    return any(
+        a in match and b in closes and match[a] != b
+        for a, b in zip(sequence, sequence[1:])
+    )
+
+
+def _is_valid_corruption(sequence: str) -> bool:
+    """Whether *sequence* is malformed without a local mismatch cue."""
+    return not (
+        _is_wellformed_dyck(sequence) or _has_mismatched_adjacent_pair(sequence)
+    )
+
+
 def _swap_until_malformed(
     chars: list[str], positions: list[int], rng: random.Random
 ) -> str | None:
@@ -73,15 +99,20 @@ def _swap_until_malformed(
     several well-formed rearrangements among its interior swaps), so
     "not equal to the original" is not a valid proxy for "malformed."
 
+    Candidates containing an adjacent mismatched pair such as ``"[)"``
+    are also rejected. Such a pair never occurs in a well-formed
+    string, so it would let a probe detect malformedness from two
+    neighbouring tokens without tracking the stack.
+
     Args:
         chars: The sequence to permute, as a list of characters.
         positions: Candidate indices into *chars*.
         rng: Random number generator instance.
 
     Returns:
-        A malformed permutation of *chars*, joined back into a
-        string, or ``None`` if no single swap or composition of two
-        swaps among *positions* breaks well-formedness.
+        A malformed permutation of *chars* with no adjacent mismatched
+        pair, joined back into a string, or ``None`` if no single swap
+        or composition of two swaps among *positions* yields one.
     """
     pairs = list(itertools.combinations(positions, 2))
     rng.shuffle(pairs)
@@ -90,7 +121,7 @@ def _swap_until_malformed(
         candidate = chars.copy()
         candidate[i], candidate[j] = candidate[j], candidate[i]
         result = "".join(candidate)
-        if not _is_wellformed_dyck(result):
+        if _is_valid_corruption(result):
             return result
 
     # No single swap broke well-formedness. Try composing two distinct
@@ -100,91 +131,114 @@ def _swap_until_malformed(
         candidate[i1], candidate[j1] = candidate[j1], candidate[i1]
         candidate[i2], candidate[j2] = candidate[j2], candidate[i2]
         result = "".join(candidate)
-        if not _is_wellformed_dyck(result):
+        if _is_valid_corruption(result):
             return result
 
     return None
 
 
-def _corrupt_dyck(sequence: str, k: int, rng: random.Random) -> str:
-    """Corrupt a well-formed Dyck sequence into a malformed one.
+def _corrupt_dyck(sequence: str, rng: random.Random) -> str | None:
+    """Corrupt a well-formed Dyck sequence into a malformed one, or give up.
 
-    Primary strategy: permute existing characters (never insert or
-    delete), so the corrupted sequence has exactly the same length and
-    exactly the same bracket-character multiset as its well-formed
-    source. This matters for probing: a corruption scheme that changes
-    sequence length or per-bracket-type counts hands a linear probe a
-    trivial surface-level shortcut, bracket-count or length parity,
-    that is linearly present even in the raw embedding layer, before
-    any nesting-order computation has happened.
+    Permutes existing characters (never inserts or deletes), so the
+    corrupted sequence has exactly the same length and exactly the
+    same bracket-character multiset as its well-formed source. This
+    matters for probing: a corruption scheme that changes sequence
+    length or per-bracket-type counts hands a linear probe a trivial
+    surface-level shortcut, bracket-count or length parity, that does
+    not require any nesting-order computation.
 
     Swaps are restricted to *interior* positions (excluding the first
-    and last character) whenever at least three exist, which
-    additionally preserves the first and last character. This matters
-    specifically for last-token pooling: a well-formed Dyck string can
-    never end in an opening bracket, so a swap that is free to touch
-    the last position hands the probe an even cheaper shortcut than a
-    length/count feature, reading malformedness off a single token's
-    identity with no computation at all.
+    and last character), which additionally preserves the first and
+    last character. A well-formed Dyck string can never start with a
+    closing bracket or end in an opening bracket, so a swap free to
+    touch either boundary would let a probe read malformedness off a
+    single token's identity. Candidates with an adjacent mismatched
+    pair such as ``"[)"`` are rejected too (see
+    ``_swap_until_malformed``), so a type violation always spans
+    non-adjacent brackets.
 
-    Fallback strategy, for sequences too short to have enough interior
-    positions (the generator does produce these, e.g. ``"()"`` at its
-    minimum, and the resulting malformed set would otherwise be biased
-    toward them): delete the first character instead of permuting.
-    This is always guaranteed malformed, the opening bracket at
-    position 0 must be matched by some later closing bracket for the
-    source to be well-formed, and deleting it leaves that closing
-    bracket to find an empty stack, while leaving the *last* character
-    untouched, so it cannot create the boundary-identity shortcut a
-    full-sequence swap risks. The tradeoff is a one-character length
-    change, which is acceptable here specifically because Pythia/
-    GPT-NeoX uses rotary position embeddings, injected inside
-    attention rather than baked into the raw token embedding, so the
-    embedding layer (layer 0) has no positional information to read a
-    length cue from at all; a length perturbation only becomes visible
-    once a later layer has incorporated position, by which point
-    detecting it is no longer free.
+    Some sources admit no such corruption (e.g. ``"()"`` has no
+    interior, and ``"(())"``'s lone interior swap yields the
+    well-formed ``"()()"``). For those this returns ``None`` instead
+    of falling back to a count- or boundary-changing edit;
+    ``generate_dyck`` then resamples the source, and restricts its
+    well-formed examples to the same corruptible sources, so both
+    classes share one length distribution.
 
     Args:
         sequence: A well-formed Dyck string.
-        k: Number of bracket types in use.
         rng: Random number generator instance.
 
     Returns:
-        A corrupted (malformed) Dyck string. Same length and
-        bracket-character multiset as *sequence*, and the same first
-        and last character, when a permutation among interior
-        positions succeeds; otherwise one character shorter, missing
-        the first character, with the last character preserved.
+        A malformed permutation of *sequence* with the same length,
+        bracket multiset, first character and last character, or
+        ``None`` if no single swap or composition of two swaps among
+        interior positions yields a valid corruption.
     """
-    chars = list(sequence)
-    n = len(chars)
-    interior = list(range(1, n - 1))
-    result: str | None = None
+    interior = list(range(1, len(sequence) - 1))
+    if len(interior) < 2:
+        return None
+    return _swap_until_malformed(list(sequence), interior, rng)
 
-    if len(interior) >= 3:
-        result = _swap_until_malformed(chars, interior, rng)
-    elif len(interior) == 2:
-        i, j = interior
-        candidate = chars.copy()
-        candidate[i], candidate[j] = candidate[j], candidate[i]
-        candidate_str = "".join(candidate)
-        if not _is_wellformed_dyck(candidate_str):
-            result = candidate_str
-        # Else: the lone interior swap happened to preserve well-formedness
-        # (e.g. "{}{}" -> "{{}}") and there is no second interior pair
-        # to compose with. Fall through to the boundary-safe deletion
-        # below rather than risk a boundary-breaking full-sequence swap.
 
-    if result is not None:
-        return result
+def _dyck_violation_type(sequence: str) -> str:
+    """Classify why a bracket sequence is (or is not) well-formed.
 
-    if n >= 2:
-        return "".join(chars[1:])
+    Args:
+        sequence: A string of bracket characters (non-bracket
+            characters are ignored).
 
-    # Too short to corrupt meaningfully at all.
-    pairs = _BRACKET_PAIRS[:k]
-    return rng.choice([b for pair in pairs for b in pair])
+    Returns:
+        ``"none"`` if well-formed; ``"depth"`` if treating every
+        bracket type as one type still fails (some prefix closes more
+        brackets than it opens, or the sequence ends with brackets
+        open), i.e. the violation is detectable from running counts
+        alone; ``"type"`` if the sequence is balanced as a single-type
+        sequence and only bracket-type matching fails, which requires
+        tracking which bracket is on top of the stack.
+    """
+    if _is_wellformed_dyck(sequence):
+        return "none"
+    opens = {open_ for open_, _ in _BRACKET_PAIRS}
+    closes = {close for _, close in _BRACKET_PAIRS}
+    depth = 0
+    for ch in sequence:
+        if ch in opens:
+            depth += 1
+        elif ch in closes:
+            depth -= 1
+            if depth < 0:
+                return "depth"
+    return "depth" if depth != 0 else "type"
+
+
+def _sample_corruptible_dyck(
+    k: int, max_depth: int, rng: random.Random
+) -> tuple[str, str]:
+    """Sample a well-formed Dyck-k string that admits a corruption.
+
+    Args:
+        k: Number of bracket types (1..4).
+        max_depth: Maximum nesting depth.
+        rng: Random number generator instance.
+
+    Returns:
+        ``(source, corrupted)``: a well-formed string and the malformed
+        permutation ``_corrupt_dyck`` produced from it.
+
+    Raises:
+        RuntimeError: If no corruptible string turns up in 10,000
+            draws (e.g. ``k=1`` with a tiny ``max_depth``).
+    """
+    for _ in range(10_000):
+        source = _generate_wellformed_dyck(k, max_depth, rng)
+        corrupted = _corrupt_dyck(source, rng)
+        if corrupted is not None:
+            return source, corrupted
+    raise RuntimeError(
+        f"No corruptible Dyck-{k} sequence found (max_depth={max_depth})"
+    )
 
 
 def _is_wellformed_dyck(sequence: str) -> bool:
@@ -218,7 +272,13 @@ def generate_dyck(
     """Generate a Dyck-k balanced-bracket dataset.
 
     Produces a 50/50 split of well-formed (label=1) and malformed
-    (label=0) bracket sequences using ``k`` bracket types.
+    (label=0) bracket sequences using ``k`` bracket types. Both
+    classes are drawn from the same source distribution (well-formed
+    strings that admit an interior permutation into a malformed one),
+    and malformed examples are such permutations, so length, bracket
+    counts and first/last bracket carry no label information, and no
+    malformed example contains an adjacent mismatched pair like
+    ``"[)"``.
 
     Characters in ``text`` are space-separated (e.g. ``"( ( ) )"``
     rather than ``"(())"``). Pythia/GPT-NeoX's BPE tokenizer merges
@@ -243,7 +303,11 @@ def generate_dyck(
         seed: Random seed for reproducibility.
 
     Returns:
-        A ``Dataset`` with columns ``text``, ``label``, ``example_id``.
+        A ``Dataset`` with columns ``text``, ``label``, ``violation``
+        and ``example_id``. ``violation`` is ``"none"`` for well-formed
+        examples and ``"depth"`` or ``"type"`` for malformed ones (see
+        ``_dyck_violation_type``), so results can be stratified by how
+        much computation detecting the corruption needs.
     """
     if k < 1 or k > len(_BRACKET_PAIRS):
         raise ValueError(
@@ -254,30 +318,28 @@ def generate_dyck(
     num_positive = num_examples // 2
     num_negative = num_examples - num_positive
 
-    texts: list[str] = []
-    labels: list[int] = []
+    rows: list[tuple[str, int, str]] = []
 
-    # Well-formed examples (label=1).
+    # Well-formed examples (label=1), drawn from the same corruptible
+    # sources the malformed examples are built from, so length and
+    # bracket-count distributions match across classes.
     for _ in range(num_positive):
-        seq = _generate_wellformed_dyck(k, max_depth, rng)
-        texts.append(" ".join(seq))
-        labels.append(1)
+        seq, _ = _sample_corruptible_dyck(k, max_depth, rng)
+        rows.append((" ".join(seq), 1, "none"))
 
     # Malformed examples (label=0).
     for _ in range(num_negative):
-        wellformed = _generate_wellformed_dyck(k, max_depth, rng)
-        corrupted = _corrupt_dyck(wellformed, k, rng)
-        texts.append(" ".join(corrupted))
-        labels.append(0)
+        _, corrupted = _sample_corruptible_dyck(k, max_depth, rng)
+        rows.append((" ".join(corrupted), 0, _dyck_violation_type(corrupted)))
 
     # Shuffle so positive and negative are interleaved.
-    combined = list(zip(texts, labels))
-    rng.shuffle(combined)
-    texts, labels = zip(*combined)  # type: ignore[assignment]
+    rng.shuffle(rows)
+    texts, labels, violations = zip(*rows)
 
     ds = Dataset.from_dict({
         "text": list(texts),
         "label": list(labels),
+        "violation": list(violations),
         "example_id": list(range(num_examples)),
     })
 

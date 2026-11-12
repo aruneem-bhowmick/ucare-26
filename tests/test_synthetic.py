@@ -15,7 +15,9 @@ from datasets import Dataset
 
 from src.data.synthetic import (
     _corrupt_dyck,
+    _dyck_violation_type,
     _generate_wellformed_dyck,
+    _has_mismatched_adjacent_pair,
     _is_wellformed_dyck,
     generate_dyck,
     generate_modular_arithmetic,
@@ -32,9 +34,9 @@ class TestGenerateDyck:
     """Tests for generate_dyck()."""
 
     def test_correct_columns(self) -> None:
-        """Output should have text, label, example_id columns."""
+        """Output should have text, label, violation, example_id columns."""
         ds = generate_dyck(k=2, num_examples=20)
-        assert set(ds.column_names) == {"text", "label", "example_id"}
+        assert set(ds.column_names) == {"text", "label", "violation", "example_id"}
 
     def test_correct_size(self) -> None:
         """Output should have the requested number of examples."""
@@ -108,52 +110,85 @@ class TestGenerateDyck:
         into a single multi-character token."""
         ds = generate_dyck(k=3, num_examples=20, seed=42)
         for text in ds["text"]:
-            assert text == " ".join(text.split(" "))
-            chars = text.split(" ")
-            assert all(len(c) == 1 for c in chars)
+            assert all(len(c) == 1 for c in text.split(" "))
 
     def test_example_ids_sequential(self) -> None:
         """Example IDs should be sequential starting from 0."""
         ds = generate_dyck(k=2, num_examples=20)
         assert ds["example_id"] == list(range(20))
 
-    def test_corruption_preserves_length_and_char_counts_when_long_enough(
-        self,
-    ) -> None:
-        """When the source has at least three interior positions
-        (length >= 5), corruption must permute rather than delete: a
-        linear probe should only be able to recover the well-formedness
-        label from character *order*, never from a raw count or length
-        feature computable at the embedding layer alone."""
+    def test_corruption_preserves_length_counts_and_boundaries(self) -> None:
+        """Every corruption must be an interior permutation: same length,
+        same bracket multiset, same first and last character. Anything
+        else hands a linear probe a count, length or boundary-token
+        shortcut that needs no nesting computation."""
         rng = random.Random(7)
-        for _ in range(50):
+        corrupted_any = 0
+        for _ in range(200):
             wellformed = _generate_wellformed_dyck(k=3, max_depth=5, rng=rng)
-            corrupted = _corrupt_dyck(wellformed, k=3, rng=rng)
+            corrupted = _corrupt_dyck(wellformed, rng=rng)
+            if corrupted is None:
+                continue
+            corrupted_any += 1
             assert not _is_wellformed_dyck(corrupted)
-            if len(wellformed) >= 5:
-                assert len(corrupted) == len(wellformed)
-                assert Counter(corrupted) == Counter(wellformed)
-
-    def test_corruption_preserves_last_character_always(self) -> None:
-        """Corrupted sequences must always keep the same last character
-        as their well-formed source, regardless of source length.
-        Last-token pooling would otherwise let a probe read
-        well-formedness off the final token alone (a well-formed
-        sequence can never end in an opening bracket), which requires
-        no structural computation at all. Sources long enough to swap
-        among interior positions (length >= 5) also keep the first
-        character and the exact length; shorter sources fall back to
-        deleting the first character instead, which is one character
-        shorter but still never touches the last character."""
-        rng = random.Random(11)
-        for _ in range(50):
-            wellformed = _generate_wellformed_dyck(k=3, max_depth=5, rng=rng)
-            corrupted = _corrupt_dyck(wellformed, k=3, rng=rng)
+            assert len(corrupted) == len(wellformed)
+            assert Counter(corrupted) == Counter(wellformed)
+            assert corrupted[0] == wellformed[0]
             assert corrupted[-1] == wellformed[-1]
-            assert len(corrupted) in (len(wellformed), len(wellformed) - 1)
-            if len(wellformed) >= 5:
-                assert corrupted[0] == wellformed[0]
-                assert len(corrupted) == len(wellformed)
+        assert corrupted_any > 100
+
+    def test_uncorruptible_sources_return_none(self) -> None:
+        """Sources with no malformed interior permutation must return
+        None rather than fall back to a count-changing edit."""
+        rng = random.Random(0)
+        assert _corrupt_dyck("()", rng) is None
+        assert _corrupt_dyck("(())", rng) is None
+        # The only interior swap gives "(][)", whose adjacent "(]" is a
+        # local mismatch cue, so it is rejected as well.
+        assert _corrupt_dyck("([])", rng) is None
+
+    def test_classes_share_surface_statistics(self) -> None:
+        """No malformed example may have odd length, start with a
+        closer or end with an opener, and both classes should have
+        the same minimum length, since they share one source pool."""
+        ds = generate_dyck(k=3, num_examples=400, seed=5)
+        lengths: dict[int, list[int]] = {0: [], 1: []}
+        for text, label in zip(ds["text"], ds["label"]):
+            chars = text.split(" ")
+            lengths[label].append(len(chars))
+            assert len(chars) % 2 == 0
+            assert chars[0] in "([{<"
+            assert chars[-1] in ")]}>"
+        assert min(lengths[0]) == min(lengths[1])
+
+    def test_no_adjacent_mismatched_pair(self) -> None:
+        """No example may contain an opener directly followed by a
+        closer of another type (e.g. "[ )"): well-formed strings never
+        have one, so it would be a two-token shortcut."""
+        ds = generate_dyck(k=3, num_examples=400, seed=9)
+        for text in ds["text"]:
+            assert not _has_mismatched_adjacent_pair(text.replace(" ", ""))
+        assert _has_mismatched_adjacent_pair("([)]")
+        assert not _has_mismatched_adjacent_pair("(()]")
+
+    def test_violation_column_matches_label(self) -> None:
+        """violation is "none" exactly for well-formed examples, and
+        malformed examples include both violation kinds."""
+        ds = generate_dyck(k=3, num_examples=300, seed=3)
+        kinds = set()
+        for text, label, violation in zip(ds["text"], ds["label"], ds["violation"]):
+            assert (violation == "none") == (label == 1)
+            assert violation == _dyck_violation_type(text)
+            kinds.add(violation)
+        assert kinds == {"none", "depth", "type"}
+
+    def test_violation_type_classification(self) -> None:
+        """Depth violations fail even as a single-type sequence; type
+        violations are balanced as one type but mismatch bracket types."""
+        assert _dyck_violation_type("([])") == "none"
+        assert _dyck_violation_type("())(") == "depth"
+        assert _dyck_violation_type("(][)") == "type"
+        assert _dyck_violation_type("([)]") == "type"
 
 
 # ---------------------------------------------------------------------------
